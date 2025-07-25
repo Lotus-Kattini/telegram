@@ -182,7 +182,8 @@ async def download_video(update: Update, context: CallbackContext):
         'postprocessors': postprocessors,
         'noplaylist': True,
         'progress_hooks': [my_hook],
-        'proxy': ''
+        'proxy': '',
+        'cookies': 'cookies.txt',
     }
 
     try:
