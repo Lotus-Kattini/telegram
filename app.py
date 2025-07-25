@@ -1,3 +1,5 @@
+# tokwen:8277700470:AAG0TUqgIZsHdb2Fc8NHUWH6Lsa4dtHNPBQ
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
 from telegram.request import HTTPXRequest
@@ -23,15 +25,15 @@ last_percent = {}
 async def start(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    group_username = "@LotusDevCommunity"
+    group_username = "@lotusDevCommunity"  # Replace with your actual group username if changed later
 
     try:
         member = await context.bot.get_chat_member(group_username, user_id)
         if member.status in ["member", "administrator", "creator"]:
             welcome_text = (
-                "👋 Welcome!\n"
-                "Send me any video URL (YouTube, etc.) and I will help you download it.\n"
-                "You can choose to download it as MP3 (audio) or MP4 (video).\n"
+                "👋 Welcome!"
+                "Send me any video URL (YouTube, etc.) and I will help you download it."
+                "You can choose to download it as MP3 (audio) or MP4 (video)."
                 "Just send me the link to get started!"
             )
             await context.bot.send_message(chat_id=chat_id, text=welcome_text)
@@ -41,7 +43,7 @@ async def start(update: Update, context: CallbackContext):
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Join Group", url=f"https://t.me/{group_username.strip('@')}")]])
         await context.bot.send_message(
             chat_id=chat_id,
-            text="🚫 You must join our group to use this bot. Click below to join and then send /start again.",
+            text="🚫 You must join our group to use this bot.Click below to join and then send /start again.",
             reply_markup=keyboard
         )
 
@@ -49,8 +51,10 @@ async def handle_message(update: Update, context: CallbackContext):
     url = update.message.text
     user_id = update.message.chat_id
 
+    # Save URL for this user
     user_links[user_id] = url
 
+    # Ask format
     keyboard = [
         [InlineKeyboardButton("🎵 MP3", callback_data='mp3')],
         [InlineKeyboardButton("🎥 MP4", callback_data='mp4')],
@@ -137,7 +141,8 @@ async def download_video(update: Update, context: CallbackContext):
     output_dir = "downloads"
     os.makedirs(output_dir, exist_ok=True)
     try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'proxy': ''}) as ydl:
+        with yt_dlp.YoutubeDL({'quiet': True, 'proxy': '',
+        'cookiefile': 'cookies.txt'}) as ydl:
             info = ydl.extract_info(url, download=False)
             video_title = info.get('title', 'video').replace('/', '_').replace('\\', '_')
             video_title = ''.join(c for c in video_title if c.isalnum() or c in (' ', '-', '_', '.')).strip()
@@ -177,12 +182,18 @@ async def download_video(update: Update, context: CallbackContext):
                     await safe_edit_message(context, user_id, message_id, "❌ File too large (>50MB). Try different quality.")
                 else:
                     with open(file_path, 'rb') as f:
-                        await asyncio.wait_for(context.bot.send_document(chat_id=user_id, document=f, filename=video_title + os.path.splitext(file)[1]), timeout=60)
-                    await asyncio.wait_for(context.bot.send_message(chat_id=user_id, text=f"✅ Downloaded! Format: {format_type.upper()}, Quality: {quality if format_type=='mp4' else 'N/A'}, Size: {file_size/(1024*1024):.1f}MB", parse_mode='Markdown'), timeout=60)
-                    try:
-                        await context.bot.delete_message(chat_id=user_id, message_id=message_id)
-                    except:
-                        pass
+                        try:
+                            await asyncio.wait_for(context.bot.send_document(chat_id=user_id, document=f, filename=video_title + os.path.splitext(file)[1]), timeout=120)
+                        except asyncio.TimeoutError:
+                            logger.warning("send_document timeout, file likely sent.")
+                        try:
+                            await asyncio.wait_for(context.bot.send_message(chat_id=user_id, text=f"✅ Downloaded! Format: {format_type.upper()}, Quality: {quality if format_type=='mp4' else 'N/A'}, Size: {file_size/(1024*1024):.1f}MB", parse_mode='Markdown'), timeout=120)
+                        except asyncio.TimeoutError:
+                            logger.warning("send_message timeout, skipping status update.")
+                        try:
+                            await context.bot.delete_message(chat_id=user_id, message_id=message_id)
+                        except:
+                            pass
                 os.remove(file_path)
                 break
     except Exception as e:
@@ -194,18 +205,32 @@ async def download_video(update: Update, context: CallbackContext):
         last_update_time.pop(user_id, None)
         user_formats.pop(user_id, None)
 
+
 def download_with_ytdlp(ydl_opts, url):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-def main():
-    import os
-    TOKEN = os.getenv("BOT_TOKEN")  # Read token from environment variable
-    if not TOKEN:
-        raise ValueError("❌ BOT_TOKEN environment variable is not set!")
+def download_cookies():
+    import requests
+    cookies_url = "https://gitlab.com/Lotus-Kattini/telegram/-/blob/main/cookies.txt?ref_type=heads"
+    token = os.getenv("GITLAB_TOKEN")
+    headers = {"PRIVATE-TOKEN": token}
+    try:
+        r = requests.get(cookies_url, headers=headers)
+        if r.status_code == 200:
+            with open("cookies.txt", "wb") as f:
+                f.write(r.content)
+            print("✅ cookies.txt downloaded from GitLab.")
+        else:
+            print(f"❌ Failed to download cookies.txt: {r.status_code}")
+    except Exception as e:
+        print(f"❌ Exception downloading cookies.txt: {e}")
 
+def main():
     request = HTTPXRequest(connection_pool_size=8, read_timeout=30, write_timeout=30, connect_timeout=10, pool_timeout=10)
-    app = ApplicationBuilder().token(TOKEN).request(request).build()
+    download_cookies()
+
+    app = (ApplicationBuilder().token("8277700470:AAG0TUqgIZsHdb2Fc8NHUWH6Lsa4dtHNPBQ").request(request).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(choose_quality, pattern='^(mp3|mp4)$'))
