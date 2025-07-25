@@ -7,6 +7,7 @@ import asyncio
 import logging
 import time
 import subprocess
+import requests
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -60,21 +61,24 @@ async def handle_message(update: Update, context: CallbackContext):
     await update.message.reply_text("Choose the format:", reply_markup=reply_markup)
 
 def download_cookies():
-    # You can adjust the file path and GitLab URL to your repo
-    cookies_url = "https://gitlab.com/api/v4/projects/LOTUS-KATTINI%2FTELEGRAM/repository/files/cookies.txt/raw?ref=main"
     token = os.getenv("GITLAB_TOKEN")
     headers = {"PRIVATE-TOKEN": token}
-    try:
-        import requests
-        r = requests.get(cookies_url, headers=headers)
-        if r.status_code == 200:
-            with open("cookies.txt", "wb") as f:
-                f.write(r.content)
-            print("✅ cookies.txt downloaded from GitLab.")
-        else:
-            print(f"❌ Failed to download cookies.txt: {r.status_code}")
-    except Exception as e:
-        print(f"❌ Exception downloading cookies.txt: {e}")
+    project_path = "Lotus-Kattini/telegram"
+    file_path = "cookies.txt"
+    branch = "main"
+    import urllib.parse
+    project_path_enc = urllib.parse.quote_plus(project_path)  # Lotus-Kattini%2Ftelegram
+    file_path_enc = urllib.parse.quote_plus(file_path)        # cookies.txt
+
+    url = f"https://gitlab.com/api/v4/projects/{project_path_enc}/repository/files/{file_path_enc}/raw?ref={branch}"
+
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        with open("cookies.txt", "wb") as f:
+            f.write(r.content)
+        print("✅ cookies.txt downloaded successfully.")
+    else:
+        print(f"❌ Failed to download cookies.txt: {r.status_code} - {r.text}")
 
 async def safe_edit_message(context: CallbackContext, user_id: int, message_id: int, text: str):
     try:
