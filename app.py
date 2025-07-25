@@ -23,7 +23,7 @@ last_percent = {}
 async def start(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    group_username = "@lotusdev_conmmunity"
+    group_username = "@LotusDevCommunity"
 
     try:
         member = await context.bot.get_chat_member(group_username, user_id)
