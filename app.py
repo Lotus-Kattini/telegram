@@ -61,7 +61,7 @@ async def handle_message(update: Update, context: CallbackContext):
 
 def download_cookies():
     # You can adjust the file path and GitLab URL to your repo
-    cookies_url = "https://gitlab.com/Lotus-Kattini/telegram/-/blob/main/cookies.txt?ref_type=heads"
+    cookies_url = "https://gitlab.com/api/v4/projects/LOTUS-KATTINI%2FTELEGRAM/repository/files/cookies.txt/raw?ref=main"
     token = os.getenv("GITLAB_TOKEN")
     headers = {"PRIVATE-TOKEN": token}
     try:
