@@ -221,21 +221,53 @@ def download_with_ytdlp(ydl_opts, url):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
+# def main():
+#     import os
+#     TOKEN = os.getenv("BOT_TOKEN")  # Read token from environment variable
+#     if not TOKEN:
+#         raise ValueError("❌ BOT_TOKEN environment variable is not set!")
+
+#     request = HTTPXRequest(connection_pool_size=8, read_timeout=30, write_timeout=30, connect_timeout=10, pool_timeout=10)
+#     download_cookies()
+#     app = ApplicationBuilder().token(TOKEN).request(request).build()
+#     app.add_handler(CommandHandler("start", start))
+#     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+#     app.add_handler(CallbackQueryHandler(choose_quality, pattern='^(mp3|mp4)$'))
+#     app.add_handler(CallbackQueryHandler(download_video, pattern='^(144|240|360|480|720|1080|best)$'))
+#     print("🤖 Bot is running...")
+#     app.run_polling(drop_pending_updates=True)
+
+# if __name__ == "__main__":
+#     main()
+
 def main():
-    import os
-    TOKEN = os.getenv("BOT_TOKEN")  # Read token from environment variable
+    TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
         raise ValueError("❌ BOT_TOKEN environment variable is not set!")
 
+    # Your Railway or hosting domain — replace with your actual domain + path
+    WEBHOOK_URL = f"https://mytelegrambot-production.up.railway.app/{TOKEN}"
+
     request = HTTPXRequest(connection_pool_size=8, read_timeout=30, write_timeout=30, connect_timeout=10, pool_timeout=10)
+
     download_cookies()
+
     app = ApplicationBuilder().token(TOKEN).request(request).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(choose_quality, pattern='^(mp3|mp4)$'))
     app.add_handler(CallbackQueryHandler(download_video, pattern='^(144|240|360|480|720|1080|best)$'))
-    print("🤖 Bot is running...")
-    app.run_polling(drop_pending_updates=True)
+
+    print("🤖 Bot is running with webhook...")
+
+    # Run webhook server
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        webhook_url=WEBHOOK_URL,
+        secret_token=TOKEN,  # Optional, helps verify requests come from Telegram
+    )
 
 if __name__ == "__main__":
     main()
