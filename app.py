@@ -9,6 +9,7 @@ import time
 import subprocess
 import requests
 import random
+import shutil
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +32,30 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0'
 ]
+
+def check_ffmpeg():
+    """Check if FFmpeg is available"""
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        logger.info("✅ FFmpeg is available")
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logger.warning("⚠️ FFmpeg not found")
+        return False
+
+def check_ffprobe():
+    """Check if FFprobe is available"""
+    try:
+        subprocess.run(['ffprobe', '-version'], capture_output=True, check=True)
+        logger.info("✅ FFprobe is available")
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logger.warning("⚠️ FFprobe not found")
+        return False
+
+# Check FFmpeg availability at startup
+FFMPEG_AVAILABLE = check_ffmpeg()
+FFPROBE_AVAILABLE = check_ffprobe()
 
 async def start(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
@@ -68,7 +93,13 @@ async def handle_message(update: Update, context: CallbackContext):
         [InlineKeyboardButton("🎥 MP4", callback_data='mp4')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Choose the format:", reply_markup=reply_markup)
+    
+    # Add warning if FFmpeg is not available
+    warning_text = ""
+    if not FFMPEG_AVAILABLE:
+        warning_text = "\n⚠️ Note: MP3 conversion may not be available without FFmpeg"
+    
+    await update.message.reply_text(f"Choose the format:{warning_text}", reply_markup=reply_markup)
 
 def download_cookies():
     token = os.getenv("GITLAB_TOKEN")
@@ -110,7 +141,8 @@ async def safe_edit_message(context: CallbackContext, user_id: int, message_id: 
         )
         return True
     except Exception as e:
-        logger.warning(f"Failed to edit message: {e}")
+        if "Message is not modified" not in str(e):
+            logger.warning(f"Failed to edit message: {e}")
         return False
 
 async def progress_hook(d, context: CallbackContext, user_id, message_id):
@@ -215,6 +247,20 @@ async def choose_quality(update: Update, context: CallbackContext):
         await query.edit_message_text("❌ URL not found. Please send it again.")
         return
     user_formats[user_id] = format_type
+    
+    # Check if user wants MP3 but FFmpeg is not available
+    if format_type == 'mp3' and not FFMPEG_AVAILABLE:
+        await query.edit_message_text(
+            "⚠️ **MP3 conversion not available**\n\n"
+            "FFmpeg is not installed on this server. I can download the audio in its original format (usually M4A or WebM).\n\n"
+            "Would you like to continue with the original audio format?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, download original audio", callback_data='audio_original')],
+                [InlineKeyboardButton("❌ Cancel", callback_data='cancel')]
+            ])
+        )
+        return
+    
     if format_type == 'mp3':
         await download_video(update, context)
     else:
@@ -287,6 +333,12 @@ def get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook):
         'ignoreerrors': False,
     }
     
+    # Add FFmpeg location if available
+    if FFMPEG_AVAILABLE:
+        ffmpeg_path = shutil.which('ffmpeg')
+        if ffmpeg_path:
+            ydl_opts['ffmpeg_location'] = os.path.dirname(ffmpeg_path)
+    
     # Add cookies if available
     if cookies_available and os.path.exists('cookies.txt'):
         ydl_opts['cookiefile'] = 'cookies.txt'
@@ -306,6 +358,14 @@ async def download_video(update: Update, context: CallbackContext):
     format_type = user_formats.get(user_id)
     url = user_links.get(user_id)
     
+    # Handle special cases
+    if quality == 'audio_original':
+        format_type = 'audio'
+        quality = 'best'
+    elif quality == 'cancel':
+        await query.edit_message_text("❌ Download cancelled.")
+        return
+    
     if not url or not format_type:
         await query.edit_message_text("❌ Missing information. Please start over.")
         return
@@ -319,8 +379,6 @@ async def download_video(update: Update, context: CallbackContext):
     output_dir = "downloads"
     os.makedirs(output_dir, exist_ok=True)
     
-
-
     timestamp = int(time.time())
     output_file = os.path.join(output_dir, f"{user_id}_{timestamp}.%(ext)s")
 
@@ -328,8 +386,16 @@ async def download_video(update: Update, context: CallbackContext):
     def my_hook(d):
         main_loop.call_soon_threadsafe(main_loop.create_task, progress_hook(d, context, user_id, message_id))
 
-    format_spec = 'bestaudio/best' if format_type == 'mp3' else ('best' if quality == 'best' else f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]')
-    postprocessors = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}] if format_type == 'mp3' else []
+    # Set format specification and postprocessors based on format type and FFmpeg availability
+    if format_type == 'mp3' and FFMPEG_AVAILABLE:
+        format_spec = 'bestaudio/best'
+        postprocessors = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
+    elif format_type == 'mp3' or format_type == 'audio':
+        format_spec = 'bestaudio[ext=m4a]/bestaudio/best'
+        postprocessors = []  # No conversion without FFmpeg
+    else:  # MP4
+        format_spec = 'best' if quality == 'best' else f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]'
+        postprocessors = []
 
     # Get enhanced options
     ydl_opts = get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook)
@@ -344,10 +410,14 @@ async def download_video(update: Update, context: CallbackContext):
         video_title = ''.join(c for c in video_title if c.isalnum() or c in (' ', '-', '_', '.')).strip()
         
         # Generate optimal format string
-        format_spec = get_best_format_string(format_type, quality, video_formats, audio_formats)
+        if format_type in ['mp3', 'audio']:
+            format_spec = get_best_format_string('mp3', quality, video_formats, audio_formats)
+        else:
+            format_spec = get_best_format_string(format_type, quality, video_formats, audio_formats)
         
+        download_type = format_type.upper() if format_type != 'audio' else 'AUDIO'
         await safe_edit_message(context, user_id, message_id,
-            f"⏬ **Starting download...**\n\n📹 **Title:** {video_title}\n🎯 **Format:** {format_type.upper()}\n📺 **Quality:** {quality if format_type=='mp4' else 'N/A'}\n🔧 **Client:** {successful_client}")
+            f"⏬ **Starting download...**\n\n📹 **Title:** {video_title}\n🎯 **Format:** {download_type}\n📺 **Quality:** {quality if format_type=='mp4' else 'N/A'}\n🔧 **Client:** {successful_client}")
         
         # Update yt-dlp options with successful client
         ydl_opts = get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook)
@@ -368,7 +438,7 @@ async def download_video(update: Update, context: CallbackContext):
                 else:
                     with open(file_path, 'rb') as f:
                         await asyncio.wait_for(context.bot.send_document(chat_id=user_id, document=f, filename=video_title + os.path.splitext(file)[1]), timeout=60)
-                    await asyncio.wait_for(context.bot.send_message(chat_id=user_id, text=f"✅ Downloaded! Format: {format_type.upper()}, Quality: {quality if format_type=='mp4' else 'N/A'}, Size: {file_size/(1024*1024):.1f}MB", parse_mode='Markdown'), timeout=60)
+                    await asyncio.wait_for(context.bot.send_message(chat_id=user_id, text=f"✅ Downloaded! Format: {download_type}, Quality: {quality if format_type=='mp4' else 'N/A'}, Size: {file_size/(1024*1024):.1f}MB", parse_mode='Markdown'), timeout=60)
                     try:
                         await context.bot.delete_message(chat_id=user_id, message_id=message_id)
                     except:
@@ -380,7 +450,11 @@ async def download_video(update: Update, context: CallbackContext):
         logger.error(f"Download error: {e}")
         error_msg = str(e).lower()
         
-        if "no video/audio formats available" in error_msg:
+        if "ffmpeg" in error_msg or "ffprobe" in error_msg:
+            await safe_edit_message(context, user_id, message_id, 
+                "❌ **Audio conversion failed**\n\n"
+                "FFmpeg is not available for audio processing. Try downloading as MP4 instead or contact the administrator.")
+        elif "no video/audio formats available" in error_msg:
             await safe_edit_message(context, user_id, message_id, 
                 "❌ **No downloadable formats found**\n\n"
                 "This video might be:\n"
@@ -430,10 +504,29 @@ def download_with_ytdlp(ydl_opts, url):
             if attempt == max_retries - 1:  # Last attempt
                 raise e  # Re-raise the exception
 
+# Add handler for the new callback queries
+async def handle_special_callbacks(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'audio_original':
+        # Set format to audio and proceed with download
+        user_id = query.message.chat_id
+        user_formats[user_id] = 'audio'
+        # Simulate quality selection
+        query.data = 'best'
+        await download_video(update, context)
+    elif query.data == 'cancel':
+        await query.edit_message_text("❌ Download cancelled.")
+
 def main():
     TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
         raise ValueError("❌ BOT_TOKEN environment variable is not set!")
+
+    # Log FFmpeg availability
+    logger.info(f"FFmpeg available: {FFMPEG_AVAILABLE}")
+    logger.info(f"FFprobe available: {FFPROBE_AVAILABLE}")
 
     request = HTTPXRequest(connection_pool_size=8, read_timeout=30, write_timeout=30, connect_timeout=10, pool_timeout=10)
     
@@ -442,6 +535,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(choose_quality, pattern='^(mp3|mp4)$'))
     app.add_handler(CallbackQueryHandler(download_video, pattern='^(144|240|360|480|720|1080|best)$'))
+    app.add_handler(CallbackQueryHandler(handle_special_callbacks, pattern='^(audio_original|cancel)$'))
     
     logger.info("🤖 Bot is running...")
     app.run_polling(drop_pending_updates=True)
