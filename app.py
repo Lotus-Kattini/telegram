@@ -137,6 +137,74 @@ async def progress_hook(d, context: CallbackContext, user_id, message_id):
     except Exception as e:
         logger.error(f"Progress hook error: {e}")
 
+async def get_available_formats(url, max_retries=3):
+    """Get available formats for a video with multiple client attempts"""
+    clients_to_try = ['android', 'web', 'ios', 'tv_embedded']
+    
+    for client in clients_to_try:
+        for attempt in range(max_retries):
+            try:
+                opts = {
+                    'quiet': True,
+                    'listformats': True,
+                    'user_agent': random.choice(USER_AGENTS),
+                    'socket_timeout': 30,
+                    'extractor_args': {
+                        'youtube': {
+                            'player_client': [client],
+                            'skip': ['hls'] if client != 'android' else [],
+                        }
+                    }
+                }
+                
+                if os.path.exists('cookies.txt'):
+                    opts['cookiefile'] = 'cookies.txt'
+                
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    formats = info.get('formats', [])
+                    
+                    # Filter out image-only formats
+                    video_formats = [f for f in formats if f.get('vcodec') != 'none' or f.get('acodec') != 'none']
+                    audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+                    
+                    if video_formats or audio_formats:
+                        logger.info(f"✅ Found formats using {client} client: {len(video_formats)} video, {len(audio_formats)} audio")
+                        return info, video_formats, audio_formats, client
+                        
+            except Exception as e:
+                logger.warning(f"Client {client} attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(random.uniform(2, 4))
+                continue
+    
+    raise Exception("No video/audio formats available from any client")
+
+def get_best_format_string(format_type, quality, available_formats, audio_formats):
+    """Generate the best format string based on available formats"""
+    
+    if format_type == 'mp3':
+        # For MP3, prioritize audio quality
+        if audio_formats:
+            return 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[height<=720]/worst'
+        else:
+            return 'best[height<=720]/worst'  # Fallback to video with audio
+    
+    else:  # MP4
+        if quality == 'best':
+            return 'best[ext=mp4]/best[ext=webm]/best/worst'
+        else:
+            quality_num = quality.replace('p', '')
+            # Create multiple fallback options
+            fallbacks = [
+                f'best[height<={quality_num}][ext=mp4]',
+                f'best[height<={quality_num}][ext=webm]',
+                f'best[height<={quality_num}]',
+                f'worst[height>={int(quality_num)//2}]',  # At least half the requested quality
+                'best[height<=720]/best/worst'  # Final fallback
+            ]
+            return '/'.join(fallbacks)
+
 async def choose_quality(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
@@ -251,73 +319,7 @@ async def download_video(update: Update, context: CallbackContext):
     output_dir = "downloads"
     os.makedirs(output_dir, exist_ok=True)
     
-async def get_available_formats(url, max_retries=3):
-    """Get available formats for a video with multiple client attempts"""
-    clients_to_try = ['android', 'web', 'ios', 'tv_embedded']
-    
-    for client in clients_to_try:
-        for attempt in range(max_retries):
-            try:
-                opts = {
-                    'quiet': True,
-                    'listformats': True,
-                    'user_agent': random.choice(USER_AGENTS),
-                    'socket_timeout': 30,
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': [client],
-                            'skip': ['hls'] if client != 'android' else [],
-                        }
-                    }
-                }
-                
-                if os.path.exists('cookies.txt'):
-                    opts['cookiefile'] = 'cookies.txt'
-                
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    formats = info.get('formats', [])
-                    
-                    # Filter out image-only formats
-                    video_formats = [f for f in formats if f.get('vcodec') != 'none' or f.get('acodec') != 'none']
-                    audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
-                    
-                    if video_formats or audio_formats:
-                        logger.info(f"✅ Found formats using {client} client: {len(video_formats)} video, {len(audio_formats)} audio")
-                        return info, video_formats, audio_formats, client
-                        
-            except Exception as e:
-                logger.warning(f"Client {client} attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(random.uniform(2, 4))
-                continue
-    
-    raise Exception("No video/audio formats available from any client")
 
-def get_best_format_string(format_type, quality, available_formats, audio_formats):
-    """Generate the best format string based on available formats"""
-    
-    if format_type == 'mp3':
-        # For MP3, prioritize audio quality
-        if audio_formats:
-            return 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[height<=720]/worst'
-        else:
-            return 'best[height<=720]/worst'  # Fallback to video with audio
-    
-    else:  # MP4
-        if quality == 'best':
-            return 'best[ext=mp4]/best[ext=webm]/best/worst'
-        else:
-            quality_num = quality.replace('p', '')
-            # Create multiple fallback options
-            fallbacks = [
-                f'best[height<={quality_num}][ext=mp4]',
-                f'best[height<={quality_num}][ext=webm]',
-                f'best[height<={quality_num}]',
-                f'worst[height>={int(quality_num)//2}]',  # At least half the requested quality
-                'best[height<=720]/best/worst'  # Final fallback
-            ]
-            return '/'.join(fallbacks)
 
     timestamp = int(time.time())
     output_file = os.path.join(output_dir, f"{user_id}_{timestamp}.%(ext)s")
