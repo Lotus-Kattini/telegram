@@ -176,13 +176,13 @@ def get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook):
         # Anti-detection measures
         'user_agent': random.choice(USER_AGENTS),
         'referer': 'https://www.youtube.com/',
-        'sleep_interval': random.uniform(1, 3),  # Random delay between requests
+        'sleep_interval': random.uniform(1, 3),
         'max_sleep_interval': 5,
         
         # Network settings
         'socket_timeout': 30,
-        'retries': 3,
-        'fragment_retries': 3,
+        'retries': 5,
+        'fragment_retries': 5,
         'skip_unavailable_fragments': True,
         
         # Headers to mimic browser behavior
@@ -193,15 +193,30 @@ def get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook):
             'DNT': '1',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
         },
         
-        # Additional extractor options
+        # Enhanced extractor options to handle format issues
         'extractor_args': {
             'youtube': {
-                'skip': ['dash', 'hls'],  # Skip DASH and HLS to reduce detection
-                'player_skip': ['js'],    # Skip JavaScript player
+                'skip': ['hls'],  # Only skip HLS, keep DASH
+                'player_client': ['android', 'web'],  # Use multiple clients
+                'player_skip': ['configs'],  # Skip only configs, not js
+                'innertube_host': 'youtubei.googleapis.com',
+                'innertube_key': None,  # Let yt-dlp handle this
             }
-        }
+        },
+        
+        # Force IPv4 to avoid potential IPv6 issues
+        'force_ipv4': True,
+        
+        # Additional options for better format extraction
+        'youtube_include_dash_manifest': True,
+        'extract_flat': False,
+        'ignoreerrors': False,
     }
     
     # Add cookies if available
@@ -236,37 +251,73 @@ async def download_video(update: Update, context: CallbackContext):
     output_dir = "downloads"
     os.makedirs(output_dir, exist_ok=True)
     
-    # Get video title with retry mechanism
-    video_title = f"video_{user_id}"
-    for attempt in range(3):
-        try:
-            # Use different user agent for each attempt
-            info_opts = {
-                'quiet': True,
-                'user_agent': random.choice(USER_AGENTS),
-                'socket_timeout': 30,
-                'extractor_args': {
-                    'youtube': {
-                        'skip': ['dash', 'hls'],
-                        'player_skip': ['js'],
+async def get_available_formats(url, max_retries=3):
+    """Get available formats for a video with multiple client attempts"""
+    clients_to_try = ['android', 'web', 'ios', 'tv_embedded']
+    
+    for client in clients_to_try:
+        for attempt in range(max_retries):
+            try:
+                opts = {
+                    'quiet': True,
+                    'listformats': True,
+                    'user_agent': random.choice(USER_AGENTS),
+                    'socket_timeout': 30,
+                    'extractor_args': {
+                        'youtube': {
+                            'player_client': [client],
+                            'skip': ['hls'] if client != 'android' else [],
+                        }
                     }
                 }
-            }
-            
-            # Add cookies if available
-            if os.path.exists('cookies.txt'):
-                info_opts['cookiefile'] = 'cookies.txt'
                 
-            with yt_dlp.YoutubeDL(info_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                video_title = info.get('title', 'video').replace('/', '_').replace('\\', '_')
-                video_title = ''.join(c for c in video_title if c.isalnum() or c in (' ', '-', '_', '.')).strip()
-                break
-        except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed to get video info: {e}")
-            if attempt < 2:
-                await asyncio.sleep(random.uniform(2, 5))  # Random delay before retry
-            continue
+                if os.path.exists('cookies.txt'):
+                    opts['cookiefile'] = 'cookies.txt'
+                
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    formats = info.get('formats', [])
+                    
+                    # Filter out image-only formats
+                    video_formats = [f for f in formats if f.get('vcodec') != 'none' or f.get('acodec') != 'none']
+                    audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+                    
+                    if video_formats or audio_formats:
+                        logger.info(f"✅ Found formats using {client} client: {len(video_formats)} video, {len(audio_formats)} audio")
+                        return info, video_formats, audio_formats, client
+                        
+            except Exception as e:
+                logger.warning(f"Client {client} attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(random.uniform(2, 4))
+                continue
+    
+    raise Exception("No video/audio formats available from any client")
+
+def get_best_format_string(format_type, quality, available_formats, audio_formats):
+    """Generate the best format string based on available formats"""
+    
+    if format_type == 'mp3':
+        # For MP3, prioritize audio quality
+        if audio_formats:
+            return 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[height<=720]/worst'
+        else:
+            return 'best[height<=720]/worst'  # Fallback to video with audio
+    
+    else:  # MP4
+        if quality == 'best':
+            return 'best[ext=mp4]/best[ext=webm]/best/worst'
+        else:
+            quality_num = quality.replace('p', '')
+            # Create multiple fallback options
+            fallbacks = [
+                f'best[height<={quality_num}][ext=mp4]',
+                f'best[height<={quality_num}][ext=webm]',
+                f'best[height<={quality_num}]',
+                f'worst[height>={int(quality_num)//2}]',  # At least half the requested quality
+                'best[height<=720]/best/worst'  # Final fallback
+            ]
+            return '/'.join(fallbacks)
 
     timestamp = int(time.time())
     output_file = os.path.join(output_dir, f"{user_id}_{timestamp}.%(ext)s")
@@ -282,8 +333,23 @@ async def download_video(update: Update, context: CallbackContext):
     ydl_opts = get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook)
 
     try:
+        # Get available formats first
+        await safe_edit_message(context, user_id, message_id, "🔍 **Checking available formats...**")
+        info, video_formats, audio_formats, successful_client = await get_available_formats(url)
+        
+        # Get video title
+        video_title = info.get('title', f'video_{user_id}').replace('/', '_').replace('\\', '_')
+        video_title = ''.join(c for c in video_title if c.isalnum() or c in (' ', '-', '_', '.')).strip()
+        
+        # Generate optimal format string
+        format_spec = get_best_format_string(format_type, quality, video_formats, audio_formats)
+        
         await safe_edit_message(context, user_id, message_id,
-            f"⏬ **Starting download...**\n\n📹 **Title:** {video_title}\n🎯 **Format:** {format_type.upper()}\n📺 **Quality:** {quality if format_type=='mp4' else 'N/A'}")
+            f"⏬ **Starting download...**\n\n📹 **Title:** {video_title}\n🎯 **Format:** {format_type.upper()}\n📺 **Quality:** {quality if format_type=='mp4' else 'N/A'}\n🔧 **Client:** {successful_client}")
+        
+        # Update yt-dlp options with successful client
+        ydl_opts = get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook)
+        ydl_opts['extractor_args']['youtube']['player_client'] = [successful_client]
         
         # Add random delay before download
         await asyncio.sleep(random.uniform(1, 3))
@@ -312,13 +378,27 @@ async def download_video(update: Update, context: CallbackContext):
         logger.error(f"Download error: {e}")
         error_msg = str(e).lower()
         
-        if "sign in to confirm" in error_msg or "bot" in error_msg:
+        if "no video/audio formats available" in error_msg:
+            await safe_edit_message(context, user_id, message_id, 
+                "❌ **No downloadable formats found**\n\n"
+                "This video might be:\n"
+                "• Region restricted\n"
+                "• Age restricted\n"
+                "• Live stream\n"
+                "• Private video\n\n"
+                "Try a different video URL.")
+        elif "sign in to confirm" in error_msg or "bot" in error_msg:
             await safe_edit_message(context, user_id, message_id, 
                 "❌ **YouTube blocked the request**\n\n"
                 "This happens due to bot detection. Please:\n"
                 "• Try again in a few minutes\n"
                 "• Use a different video URL\n"
                 "• The issue is temporary and should resolve soon")
+        elif "requested format is not available" in error_msg:
+            await safe_edit_message(context, user_id, message_id,
+                "❌ **Format not available**\n\n"
+                "Try selecting a different quality option.\n"
+                "The video might not have the requested quality available.")
         else:
             await safe_edit_message(context, user_id, message_id, f"❌ **Download failed:** {str(e)[:100]}...")
             
