@@ -10,6 +10,7 @@ import subprocess
 import requests
 import random
 import shutil
+import socket
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +33,16 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0'
 ]
+
+def check_network():
+    """Check basic network connectivity"""
+    try:
+        socket.create_connection(("8.8.8.8", 53), timeout=5)
+        logger.info("✅ Network connectivity OK")
+        return True
+    except OSError:
+        logger.warning("⚠️ Network connectivity issues detected")
+        return False
 
 def check_ffmpeg():
     """Check if FFmpeg is available"""
@@ -169,73 +180,188 @@ async def progress_hook(d, context: CallbackContext, user_id, message_id):
     except Exception as e:
         logger.error(f"Progress hook error: {e}")
 
-async def get_available_formats(url, max_retries=3):
-    """Get available formats for a video with multiple client attempts"""
-    clients_to_try = ['android', 'web', 'ios', 'tv_embedded']
+async def get_available_formats(url, max_retries=2):
+    """Get available formats for a video with robust error handling"""
     
-    for client in clients_to_try:
-        for attempt in range(max_retries):
-            try:
-                opts = {
-                    'quiet': True,
-                    'listformats': True,
-                    'user_agent': random.choice(USER_AGENTS),
-                    'socket_timeout': 30,
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': [client],
-                            'skip': ['hls'] if client != 'android' else [],
-                        }
+    # Check network connectivity first
+    if not check_network():
+        raise Exception("Network connectivity issues detected")
+    
+    # Try different strategies
+    strategies = [
+        {
+            'name': 'web_basic',
+            'opts': {
+                'quiet': True,
+                'listformats': True,
+                'user_agent': random.choice(USER_AGENTS),
+                'socket_timeout': 30,
+                'force_ipv4': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['web'],
+                        'skip': ['hls', 'dash'],
                     }
                 }
+            }
+        },
+        {
+            'name': 'android_basic',
+            'opts': {
+                'quiet': True,
+                'listformats': True,
+                'user_agent': random.choice(USER_AGENTS),
+                'socket_timeout': 30,
+                'force_ipv4': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android'],
+                        'skip': ['hls'],
+                    }
+                }
+            }
+        },
+        {
+            'name': 'ios_fallback',
+            'opts': {
+                'quiet': True,
+                'listformats': True,
+                'user_agent': random.choice(USER_AGENTS),
+                'socket_timeout': 45,
+                'force_ipv4': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['ios'],
+                    }
+                }
+            }
+        }
+    ]
+    
+    for strategy in strategies:
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Trying strategy: {strategy['name']}, attempt: {attempt + 1}")
                 
+                opts = strategy['opts'].copy()
+                
+                # Add cookies if available
                 if os.path.exists('cookies.txt'):
                     opts['cookiefile'] = 'cookies.txt'
+                
+                # Add proxy for some attempts
+                proxy = os.getenv('PROXY_URL')
+                if proxy and attempt > 0:
+                    opts['proxy'] = proxy
                 
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     formats = info.get('formats', [])
                     
-                    # Filter out image-only formats
-                    video_formats = [f for f in formats if f.get('vcodec') != 'none' or f.get('acodec') != 'none']
-                    audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+                    if not formats:
+                        logger.warning(f"No formats found with {strategy['name']}")
+                        continue
+                    
+                    # Filter formats more carefully
+                    video_formats = []
+                    audio_formats = []
+                    
+                    for f in formats:
+                        # Skip image formats explicitly
+                        if f.get('vcodec') == 'none' and f.get('acodec') == 'none':
+                            continue
+                        if f.get('format_note') and 'image' in f.get('format_note', '').lower():
+                            continue
+                        
+                        # Audio formats
+                        if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+                            audio_formats.append(f)
+                        # Video formats with audio
+                        elif f.get('vcodec') != 'none' and f.get('acodec') != 'none':
+                            video_formats.append(f)
+                        # Video-only formats
+                        elif f.get('vcodec') != 'none':
+                            video_formats.append(f)
                     
                     if video_formats or audio_formats:
-                        logger.info(f"✅ Found formats using {client} client: {len(video_formats)} video, {len(audio_formats)} audio")
-                        return info, video_formats, audio_formats, client
+                        logger.info(f"✅ Found formats using {strategy['name']}: {len(video_formats)} video, {len(audio_formats)} audio")
+                        return info, video_formats, audio_formats, strategy['name']
                         
             except Exception as e:
-                logger.warning(f"Client {client} attempt {attempt + 1} failed: {e}")
+                error_msg = str(e).lower()
+                logger.warning(f"Strategy {strategy['name']} attempt {attempt + 1} failed: {e}")
+                
+                # Handle specific DNS errors
+                if "failed to resolve" in error_msg or "name or service not known" in error_msg:
+                    logger.error("DNS resolution failed - network issues detected")
+                    await asyncio.sleep(random.uniform(3, 6))
+                    continue
+                
                 if attempt < max_retries - 1:
                     await asyncio.sleep(random.uniform(2, 4))
                 continue
     
-    raise Exception("No video/audio formats available from any client")
+    raise Exception("Unable to extract video formats - video may be restricted, private, or unavailable")
 
-def get_best_format_string(format_type, quality, available_formats, audio_formats):
-    """Generate the best format string based on available formats"""
+def get_smart_format_string(format_type, quality, video_formats, audio_formats):
+    """Generate smart format string based on actually available formats"""
     
-    if format_type == 'mp3':
-        # For MP3, prioritize audio quality
+    if format_type == 'mp3' or format_type == 'audio':
+        # For audio, prefer standalone audio formats
         if audio_formats:
-            return 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[height<=720]/worst'
+            # Sort by quality (bitrate or format preference)
+            best_audio_formats = []
+            for fmt in audio_formats:
+                ext = fmt.get('ext', '')
+                if ext in ['m4a', 'mp3', 'aac']:
+                    best_audio_formats.append(f"format_id={fmt['format_id']}")
+            
+            if best_audio_formats:
+                return '/'.join(best_audio_formats[:3]) + '/bestaudio/best'
+            else:
+                return 'bestaudio/best'
         else:
-            return 'best[height<=720]/worst'  # Fallback to video with audio
+            # Fallback to video with audio
+            return 'best[height<=720]/best/worst'
     
     else:  # MP4
+        if not video_formats:
+            return 'best/worst'
+        
+        # Build format string based on available qualities
+        format_options = []
+        
         if quality == 'best':
-            return 'best[ext=mp4]/best[ext=webm]/best/worst'
+            # Get best available formats
+            for fmt in video_formats[:5]:  # Top 5 formats
+                if fmt.get('height'):
+                    format_options.append(f"format_id={fmt['format_id']}")
+            
+            format_options.extend(['best[ext=mp4]', 'best[ext=webm]', 'best'])
         else:
+            # Quality-specific
             quality_num = quality.replace('p', '')
-            # Create multiple fallback options
-            fallbacks = [
+            
+            # Find formats close to requested quality
+            suitable_formats = []
+            for fmt in video_formats:
+                fmt_height = fmt.get('height', 0)
+                if fmt_height and abs(fmt_height - int(quality_num)) <= 100:
+                    suitable_formats.append(f"format_id={fmt['format_id']}")
+            
+            if suitable_formats:
+                format_options.extend(suitable_formats[:3])
+            
+            # Add fallback options
+            format_options.extend([
                 f'best[height<={quality_num}][ext=mp4]',
-                f'best[height<={quality_num}][ext=webm]',
                 f'best[height<={quality_num}]',
-                f'worst[height>={int(quality_num)//2}]',  # At least half the requested quality
-                'best[height<=720]/best/worst'  # Final fallback
-            ]
-            return '/'.join(fallbacks)
+                f'worst[height>={int(quality_num)//2}]',
+                'best[height<=720]',
+                'best'
+            ])
+        
+        return '/'.join(format_options[:8])  # Limit to prevent overly long format strings
 
 async def choose_quality(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -265,7 +391,6 @@ async def choose_quality(update: Update, context: CallbackContext):
         await download_video(update, context)
     else:
         keyboard = [
-            [InlineKeyboardButton("144p", callback_data='144'), InlineKeyboardButton("240p", callback_data='240')],
             [InlineKeyboardButton("360p", callback_data='360'), InlineKeyboardButton("480p", callback_data='480')],
             [InlineKeyboardButton("720p", callback_data='720'), InlineKeyboardButton("1080p", callback_data='1080')],
             [InlineKeyboardButton("Best Available", callback_data='best')]
@@ -274,12 +399,12 @@ async def choose_quality(update: Update, context: CallbackContext):
         await query.edit_message_text("Choose video quality:", reply_markup=reply_markup)
 
 def get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook):
-    """Get yt-dlp options with enhanced anti-detection measures"""
+    """Get yt-dlp options with enhanced stability"""
     
     # Download cookies if available
     cookies_available = download_cookies()
     
-    # Base options
+    # Base options with focus on stability
     ydl_opts = {
         'outtmpl': output_file,
         'format': format_spec,
@@ -287,50 +412,25 @@ def get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook):
         'noplaylist': True,
         'progress_hooks': [my_hook],
         
-        # Anti-detection measures
+        # Network stability
         'user_agent': random.choice(USER_AGENTS),
-        'referer': 'https://www.youtube.com/',
-        'sleep_interval': random.uniform(1, 3),
-        'max_sleep_interval': 5,
-        
-        # Network settings
-        'socket_timeout': 30,
-        'retries': 5,
-        'fragment_retries': 5,
+        'socket_timeout': 45,
+        'retries': 3,
+        'fragment_retries': 3,
         'skip_unavailable_fragments': True,
+        'force_ipv4': True,
         
-        # Headers to mimic browser behavior
-        'http_headers': {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-        },
-        
-        # Enhanced extractor options to handle format issues
+        # Conservative extractor settings
         'extractor_args': {
             'youtube': {
-                'skip': ['hls'],  # Only skip HLS, keep DASH
-                'player_client': ['android', 'web'],  # Use multiple clients
-                'player_skip': ['configs'],  # Skip only configs, not js
-                'innertube_host': 'youtubei.googleapis.com',
-                'innertube_key': None,  # Let yt-dlp handle this
+                'skip': ['hls'],  # Skip problematic formats
+                'player_client': ['web'],  # Start with most stable client
             }
         },
         
-        # Force IPv4 to avoid potential IPv6 issues
-        'force_ipv4': True,
-        
-        # Additional options for better format extraction
-        'youtube_include_dash_manifest': True,
-        'extract_flat': False,
+        # Error handling
         'ignoreerrors': False,
+        'no_warnings': False,
     }
     
     # Add FFmpeg location if available
@@ -370,7 +470,7 @@ async def download_video(update: Update, context: CallbackContext):
         await query.edit_message_text("❌ Missing information. Please start over.")
         return
 
-    message = await query.edit_message_text(f"🔍 Getting video info...")
+    message = await query.edit_message_text(f"🔍 **Checking video availability...**")
     message_id = message.message_id
     user_messages[user_id] = message_id
     last_update_time[user_id] = 0
@@ -386,123 +486,158 @@ async def download_video(update: Update, context: CallbackContext):
     def my_hook(d):
         main_loop.call_soon_threadsafe(main_loop.create_task, progress_hook(d, context, user_id, message_id))
 
-    # Set format specification and postprocessors based on format type and FFmpeg availability
-    if format_type == 'mp3' and FFMPEG_AVAILABLE:
-        format_spec = 'bestaudio/best'
-        postprocessors = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
-    elif format_type == 'mp3' or format_type == 'audio':
-        format_spec = 'bestaudio[ext=m4a]/bestaudio/best'
-        postprocessors = []  # No conversion without FFmpeg
-    else:  # MP4
-        format_spec = 'best' if quality == 'best' else f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]'
-        postprocessors = []
-
-    # Get enhanced options
-    ydl_opts = get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook)
-
     try:
-        # Get available formats first
-        await safe_edit_message(context, user_id, message_id, "🔍 **Checking available formats...**")
-        info, video_formats, audio_formats, successful_client = await get_available_formats(url)
+        # Get available formats first with better error handling
+        await safe_edit_message(context, user_id, message_id, "🔍 **Analyzing video formats...**")
+        info, video_formats, audio_formats, successful_strategy = await get_available_formats(url)
+        
+        # Check if we have usable formats
+        if not video_formats and not audio_formats:
+            await safe_edit_message(context, user_id, message_id, 
+                "❌ **No downloadable content found**\n\n"
+                "This video may be:\n"
+                "• A live stream or premiere\n"
+                "• Region/age restricted\n"
+                "• Private or deleted\n"
+                "• Contains only images\n\n"
+                "Please try a different video.")
+            return
         
         # Get video title
         video_title = info.get('title', f'video_{user_id}').replace('/', '_').replace('\\', '_')
-        video_title = ''.join(c for c in video_title if c.isalnum() or c in (' ', '-', '_', '.')).strip()
+        video_title = ''.join(c for c in video_title if c.isalnum() or c in (' ', '-', '_', '.')).strip()[:50]
         
         # Generate optimal format string
-        if format_type in ['mp3', 'audio']:
-            format_spec = get_best_format_string('mp3', quality, video_formats, audio_formats)
+        format_spec = get_smart_format_string(format_type, quality, video_formats, audio_formats)
+        
+        # Set postprocessors
+        if format_type == 'mp3' and FFMPEG_AVAILABLE:
+            postprocessors = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
         else:
-            format_spec = get_best_format_string(format_type, quality, video_formats, audio_formats)
+            postprocessors = []
         
         download_type = format_type.upper() if format_type != 'audio' else 'AUDIO'
         await safe_edit_message(context, user_id, message_id,
-            f"⏬ **Starting download...**\n\n📹 **Title:** {video_title}\n🎯 **Format:** {download_type}\n📺 **Quality:** {quality if format_type=='mp4' else 'N/A'}\n🔧 **Client:** {successful_client}")
+            f"⏬ **Starting download...**\n\n📹 **Title:** {video_title}\n🎯 **Format:** {download_type}\n📺 **Quality:** {quality if format_type=='mp4' else 'Best Available'}\n🔧 **Method:** {successful_strategy}")
         
-        # Update yt-dlp options with successful client
+        # Get enhanced options
         ydl_opts = get_enhanced_ydl_opts(output_file, format_spec, postprocessors, my_hook)
-        ydl_opts['extractor_args']['youtube']['player_client'] = [successful_client]
         
         # Add random delay before download
-        await asyncio.sleep(random.uniform(1, 3))
+        await asyncio.sleep(random.uniform(1, 2))
         
         await main_loop.run_in_executor(None, download_with_ytdlp, ydl_opts, url)
         await safe_edit_message(context, user_id, message_id, "📤 **Uploading file...**")
 
+        # Find and upload the downloaded file
         for file in os.listdir(output_dir):
             if file.startswith(f"{user_id}_{timestamp}"):
                 file_path = os.path.join(output_dir, file)
                 file_size = os.path.getsize(file_path)
+                
                 if file_size > 50*1024*1024:
-                    await safe_edit_message(context, user_id, message_id, "❌ File too large (>50MB). Try different quality.")
+                    await safe_edit_message(context, user_id, message_id, 
+                        f"❌ **File too large** ({file_size/(1024*1024):.1f}MB > 50MB)\n\n"
+                        "Try selecting a lower quality option.")
                 else:
+                    # Determine appropriate filename
+                    file_ext = os.path.splitext(file)[1]
+                    filename = f"{video_title}{file_ext}"
+                    
                     with open(file_path, 'rb') as f:
-                        await asyncio.wait_for(context.bot.send_document(chat_id=user_id, document=f, filename=video_title + os.path.splitext(file)[1]), timeout=60)
-                    await asyncio.wait_for(context.bot.send_message(chat_id=user_id, text=f"✅ Downloaded! Format: {download_type}, Quality: {quality if format_type=='mp4' else 'N/A'}, Size: {file_size/(1024*1024):.1f}MB", parse_mode='Markdown'), timeout=60)
+                        await asyncio.wait_for(
+                            context.bot.send_document(
+                                chat_id=user_id, 
+                                document=f, 
+                                filename=filename
+                            ), 
+                            timeout=120
+                        )
+                    
+                    await asyncio.wait_for(
+                        context.bot.send_message(
+                            chat_id=user_id, 
+                            text=f"✅ **Download completed!**\n\n"
+                                 f"📋 **Format:** {download_type}\n"
+                                 f"📊 **Quality:** {quality if format_type=='mp4' else 'Best Available'}\n"
+                                 f"📦 **Size:** {file_size/(1024*1024):.1f}MB", 
+                            parse_mode='Markdown'
+                        ), 
+                        timeout=30
+                    )
+                    
                     try:
                         await context.bot.delete_message(chat_id=user_id, message_id=message_id)
                     except:
                         pass
-                os.remove(file_path)
+                
+                # Clean up file
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
                 break
+        else:
+            await safe_edit_message(context, user_id, message_id, "❌ **Download failed** - No output file generated")
                 
     except Exception as e:
         logger.error(f"Download error: {e}")
         error_msg = str(e).lower()
         
-        if "ffmpeg" in error_msg or "ffprobe" in error_msg:
+        if "network connectivity" in error_msg or "failed to resolve" in error_msg:
             await safe_edit_message(context, user_id, message_id, 
-                "❌ **Audio conversion failed**\n\n"
-                "FFmpeg is not available for audio processing. Try downloading as MP4 instead or contact the administrator.")
-        elif "no video/audio formats available" in error_msg:
+                "❌ **Network Error**\n\n"
+                "Connection issues detected. This may be temporary.\n"
+                "Please try again in a few minutes.")
+        elif "no downloadable content" in error_msg or "only images" in error_msg:
             await safe_edit_message(context, user_id, message_id, 
-                "❌ **No downloadable formats found**\n\n"
-                "This video might be:\n"
-                "• Region restricted\n"
-                "• Age restricted\n"
-                "• Live stream\n"
-                "• Private video\n\n"
-                "Try a different video URL.")
-        elif "sign in to confirm" in error_msg or "bot" in error_msg:
+                "❌ **Content Not Available**\n\n"
+                "This video doesn't have downloadable audio/video content.\n"
+                "It may be a live stream, image post, or restricted content.")
+        elif "ffmpeg" in error_msg:
             await safe_edit_message(context, user_id, message_id, 
-                "❌ **YouTube blocked the request**\n\n"
-                "This happens due to bot detection. Please:\n"
-                "• Try again in a few minutes\n"
-                "• Use a different video URL\n"
-                "• The issue is temporary and should resolve soon")
-        elif "requested format is not available" in error_msg:
-            await safe_edit_message(context, user_id, message_id,
-                "❌ **Format not available**\n\n"
-                "Try selecting a different quality option.\n"
-                "The video might not have the requested quality available.")
+                "❌ **Audio Processing Failed**\n\n"
+                "Try downloading as MP4 instead, or contact support.")
+        elif "sign in" in error_msg or "bot" in error_msg:
+            await safe_edit_message(context, user_id, message_id, 
+                "❌ **Access Blocked**\n\n"
+                "YouTube has temporarily blocked this request.\n"
+                "Please try again in 10-15 minutes.")
         else:
-            await safe_edit_message(context, user_id, message_id, f"❌ **Download failed:** {str(e)[:100]}...")
+            await safe_edit_message(context, user_id, message_id, 
+                f"❌ **Download Failed**\n\n"
+                f"Error: {str(e)[:100]}...\n\n"
+                f"Please try a different video or quality setting.")
             
     finally:
+        # Clean up
         user_messages.pop(user_id, None)
         last_percent.pop(user_id, None)
         last_update_time.pop(user_id, None)
         user_formats.pop(user_id, None)
 
 def download_with_ytdlp(ydl_opts, url):
-    """Download with retry mechanism"""
-    max_retries = 3
+    """Download with improved retry mechanism"""
+    max_retries = 2
+    
     for attempt in range(max_retries):
         try:
-            # Add random delay between attempts
+            # Add delay between attempts
             if attempt > 0:
-                time.sleep(random.uniform(5, 10))
-                # Change user agent for retry
+                time.sleep(random.uniform(3, 6))
+                # Try different client on retry
                 ydl_opts['user_agent'] = random.choice(USER_AGENTS)
+                if 'extractor_args' in ydl_opts:
+                    ydl_opts['extractor_args']['youtube']['player_client'] = ['android', 'web'][attempt % 2]
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
-            return  # Success, exit function
+            return  # Success
             
         except Exception as e:
             logger.error(f"Download attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:  # Last attempt
-                raise e  # Re-raise the exception
+            if attempt == max_retries - 1:
+                raise e
 
 # Add handler for the new callback queries
 async def handle_special_callbacks(update: Update, context: CallbackContext):
@@ -524,17 +659,24 @@ def main():
     if not TOKEN:
         raise ValueError("❌ BOT_TOKEN environment variable is not set!")
 
-    # Log FFmpeg availability
+    # Log system status
     logger.info(f"FFmpeg available: {FFMPEG_AVAILABLE}")
     logger.info(f"FFprobe available: {FFPROBE_AVAILABLE}")
+    logger.info(f"Network connectivity: {check_network()}")
 
-    request = HTTPXRequest(connection_pool_size=8, read_timeout=30, write_timeout=30, connect_timeout=10, pool_timeout=10)
+    request = HTTPXRequest(
+        connection_pool_size=8, 
+        read_timeout=60, 
+        write_timeout=60, 
+        connect_timeout=15, 
+        pool_timeout=15
+    )
     
     app = ApplicationBuilder().token(TOKEN).request(request).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(choose_quality, pattern='^(mp3|mp4)$'))
-    app.add_handler(CallbackQueryHandler(download_video, pattern='^(144|240|360|480|720|1080|best)$'))
+    app.add_handler(CallbackQueryHandler(download_video, pattern='^(360|480|720|1080|best)$'))
     app.add_handler(CallbackQueryHandler(handle_special_callbacks, pattern='^(audio_original|cancel)$'))
     
     logger.info("🤖 Bot is running...")
